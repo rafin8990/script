@@ -141,30 +141,49 @@ app.post('/api/rfid', async (req, res) => {
     const errors = [];
     
     for (let i = 0; i < tagsToProcess.length; i++) {
+      const tagData = tagsToProcess[i];
       const { 
         form_data, 
         status = 'available', 
         parent_tag_id = null, 
         current_location_id = null 
-      } = tagsToProcess[i];
+      } = tagData;
       
-      // Parse form_data if it's a string
+      // Extract tag_uid from various possible data structures
       let tag_uid;
-      try {
-        if (typeof form_data === 'string') {
-          // Parse the string array format "[1,assfdf]"
-          const parsedArray = JSON.parse(form_data);
-          if (Array.isArray(parsedArray) && parsedArray.length >= 2) {
-            // Use the second element as tag_uid (assfdf in your example)
-            tag_uid = parsedArray[1];
+      
+      // Check if form_data exists
+      if (form_data !== undefined) {
+        try {
+          if (typeof form_data === 'string') {
+            // Parse the string array format "[1,assfdf]"
+            const parsedArray = JSON.parse(form_data);
+            if (Array.isArray(parsedArray) && parsedArray.length >= 2) {
+              // Use the second element as tag_uid (assfdf in your example)
+              tag_uid = parsedArray[1];
+            } else {
+              tag_uid = form_data; // Use the whole string if parsing fails
+            }
           } else {
-            tag_uid = form_data; // Use the whole string if parsing fails
+            tag_uid = form_data;
           }
-        } else {
-          tag_uid = form_data;
+        } catch (parseError) {
+          tag_uid = form_data; // Use the original value if parsing fails
         }
-      } catch (parseError) {
-        tag_uid = form_data; // Use the original value if parsing fails
+      } else {
+        // If no form_data, check if the object has a single key-value pair
+        const keys = Object.keys(tagData);
+        if (keys.length === 1) {
+          const key = keys[0];
+          const value = tagData[key];
+          
+          // If the key looks like a tag UID (contains comma or is alphanumeric)
+          if (key.includes(',') || /^[a-zA-Z0-9]+$/.test(key)) {
+            tag_uid = key;
+          } else if (value && typeof value === 'string') {
+            tag_uid = value;
+          }
+        }
       }
       
       console.log(`Processing tag ${i}:`, { form_data, tag_uid, status, parent_tag_id, current_location_id });
