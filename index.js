@@ -141,7 +141,12 @@ app.post('/api/rfid', async (req, res) => {
     const errors = [];
     
     for (let i = 0; i < tagsToProcess.length; i++) {
-      const { form_data, status = 'available' } = tagsToProcess[i];
+      const { 
+        form_data, 
+        status = 'available', 
+        parent_tag_id = null, 
+        current_location_id = null 
+      } = tagsToProcess[i];
       
       // Parse form_data if it's a string
       let tag_uid;
@@ -162,7 +167,7 @@ app.post('/api/rfid', async (req, res) => {
         tag_uid = form_data; // Use the original value if parsing fails
       }
       
-      console.log(`Processing tag ${i}:`, { form_data, tag_uid, status });
+      console.log(`Processing tag ${i}:`, { form_data, tag_uid, status, parent_tag_id, current_location_id });
       
       // Validation
       if (!tag_uid) {
@@ -175,6 +180,30 @@ app.post('/api/rfid', async (req, res) => {
         console.log(`Tag ${i}: Invalid status: ${status}`);
         errors.push({ index: i, error: 'Invalid status. Must be one of: available, reserved, assigned, consumed, lost, damaged' });
         continue;
+      }
+      
+      // Validate parent_tag_id if provided
+      if (parent_tag_id !== null && parent_tag_id !== undefined) {
+        const parentExists = await pool.query(
+          'SELECT id FROM rfid_tags WHERE id = $1',
+          [parent_tag_id]
+        );
+        if (parentExists.rows.length === 0) {
+          errors.push({ index: i, error: 'Invalid parent_tag_id: parent tag does not exist' });
+          continue;
+        }
+      }
+      
+      // Validate current_location_id if provided
+      if (current_location_id !== null && current_location_id !== undefined) {
+        const locationExists = await pool.query(
+          'SELECT id FROM locations WHERE id = $1',
+          [current_location_id]
+        );
+        if (locationExists.rows.length === 0) {
+          errors.push({ index: i, error: 'Invalid current_location_id: location does not exist' });
+          continue;
+        }
       }
       
       try {
@@ -191,11 +220,11 @@ app.post('/api/rfid', async (req, res) => {
           continue;
         }
         
-        // Insert new tag
+        // Insert new tag with all fields
         console.log(`Tag ${i}: Inserting...`);
         const result = await pool.query(
-          'INSERT INTO rfid_tags (tag_uid, status) VALUES ($1, $2) RETURNING *',
-          [tag_uid, status]
+          'INSERT INTO rfid_tags (tag_uid, status, parent_tag_id, current_location_id) VALUES ($1, $2, $3, $4) RETURNING *',
+          [tag_uid, status, parent_tag_id, current_location_id]
         );
         
         console.log(`Tag ${i}: Inserted successfully:`, result.rows[0]);
@@ -245,30 +274,88 @@ app.post('/api/rfid', async (req, res) => {
   }
 });
 
-// PUT /api/rfid/:tag_uid - Update RFID tag status
+// PUT /api/rfid/:tag_uid - Update RFID tag
 app.put('/api/rfid/:tag_uid', async (req, res) => {
   try {
     const { tag_uid } = req.params;
-    const { status } = req.body;
+    const { status, parent_tag_id, current_location_id } = req.body;
     
-    if (!status) {
+    // Check if at least one field is provided for update
+    if (!status && parent_tag_id === undefined && current_location_id === undefined) {
       return res.status(400).json({
         success: false,
-        message: 'status is required'
+        message: 'At least one field (status, parent_tag_id, or current_location_id) is required for update'
       });
     }
     
-    if (!['available', 'reserved', 'assigned', 'consumed', 'lost', 'damaged'].includes(status)) {
+    // Validate status if provided
+    if (status && !['available', 'reserved', 'assigned', 'consumed', 'lost', 'damaged'].includes(status)) {
       return res.status(400).json({
         success: false,
         message: 'Invalid status. Must be one of: available, reserved, assigned, consumed, lost, damaged'
       });
     }
     
-    const result = await pool.query(
-      'UPDATE rfid_tags SET status = $1, updated_at = NOW() WHERE tag_uid = $2 RETURNING *',
-      [status, tag_uid]
-    );
+    // Validate parent_tag_id if provided
+    if (parent_tag_id !== null && parent_tag_id !== undefined) {
+      const parentExists = await pool.query(
+        'SELECT id FROM rfid_tags WHERE id = $1',
+        [parent_tag_id]
+      );
+      if (parentExists.rows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid parent_tag_id: parent tag does not exist'
+        });
+      }
+    }
+    
+    // Validate current_location_id if provided
+    if (current_location_id !== null && current_location_id !== undefined) {
+      const locationExists = await pool.query(
+        'SELECT id FROM locations WHERE id = $1',
+        [current_location_id]
+      );
+      if (locationExists.rows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid current_location_id: location does not exist'
+        });
+      }
+    }
+    
+    // Build dynamic update query
+    const updateFields = [];
+    const values = [];
+    let paramCount = 1;
+    
+    if (status) {
+      updateFields.push(`status = $${paramCount}`);
+      values.push(status);
+      paramCount++;
+    }
+    
+    if (parent_tag_id !== undefined) {
+      updateFields.push(`parent_tag_id = $${paramCount}`);
+      values.push(parent_tag_id);
+      paramCount++;
+    }
+    
+    if (current_location_id !== undefined) {
+      updateFields.push(`current_location_id = $${paramCount}`);
+      values.push(current_location_id);
+      paramCount++;
+    }
+    
+    // Always update the updated_at timestamp
+    updateFields.push(`updated_at = NOW()`);
+    
+    // Add tag_uid parameter
+    values.push(tag_uid);
+    
+    const query = `UPDATE rfid_tags SET ${updateFields.join(', ')} WHERE tag_uid = $${paramCount} RETURNING *`;
+    
+    const result = await pool.query(query, values);
     
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -386,7 +473,7 @@ app.post('/api/rfid/bulk', async (req, res) => {
       const errors = [];
       
       for (let i = 0; i < tags.length; i++) {
-        const { tag_uid, status = 'available' } = tags[i];
+        const { tag_uid, status = 'available', parent_tag_id = null, current_location_id = null } = tags[i];
         
         if (!tag_uid) {
           errors.push({ index: i, error: 'tag_uid is required' });
@@ -398,10 +485,34 @@ app.post('/api/rfid/bulk', async (req, res) => {
           continue;
         }
         
+        // Validate parent_tag_id if provided
+        if (parent_tag_id !== null && parent_tag_id !== undefined) {
+          const parentExists = await client.query(
+            'SELECT id FROM rfid_tags WHERE id = $1',
+            [parent_tag_id]
+          );
+          if (parentExists.rows.length === 0) {
+            errors.push({ index: i, error: 'Invalid parent_tag_id: parent tag does not exist' });
+            continue;
+          }
+        }
+        
+        // Validate current_location_id if provided
+        if (current_location_id !== null && current_location_id !== undefined) {
+          const locationExists = await client.query(
+            'SELECT id FROM locations WHERE id = $1',
+            [current_location_id]
+          );
+          if (locationExists.rows.length === 0) {
+            errors.push({ index: i, error: 'Invalid current_location_id: location does not exist' });
+            continue;
+          }
+        }
+        
         try {
           const result = await client.query(
-            'INSERT INTO rfid_tags (tag_uid, status) VALUES ($1, $2) RETURNING *',
-            [tag_uid, status]
+            'INSERT INTO rfid_tags (tag_uid, status, parent_tag_id, current_location_id) VALUES ($1, $2, $3, $4) RETURNING *',
+            [tag_uid, status, parent_tag_id, current_location_id]
           );
           results.push(result.rows[0]);
         } catch (error) {
