@@ -22,10 +22,10 @@ const dbConfig = {
   ssl: {
     rejectUnauthorized: false
   },
-  // Vercel serverless optimizations
-  max: 1,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  // Pool & timeout tuning (overridable via env)
+  max: parseInt(process.env.DB_POOL_MAX || '5'),
+  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '30000'),
+  connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT_MS || '10000'),
 };
 
 // Debug environment variables (remove in production)
@@ -38,6 +38,23 @@ console.log('Database Config:', {
 });
 
 const pool = new Pool(dbConfig);
+
+// Acquire client with simple retry to mitigate transient connection issues
+async function getClientWithRetry(retries = parseInt(process.env.DB_CONNECT_RETRIES || '3'), delayMs = parseInt(process.env.DB_CONNECT_RETRY_DELAY_MS || '500')) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const client = await pool.connect();
+      return client;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
 
 // Test database connection
 pool.on('connect', () => {
@@ -116,8 +133,9 @@ app.get('/api/rfid/:tag_uid', async (req, res) => {
 // POST /api/rfid - Create new RFID tag (accepts single or array), maps to EPC-based schema
 // POST /api/v1/uhf/tags - Create single UHF tag (matches RFID service structure)
 app.post('/api/v1/uhf/tags', async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await getClientWithRetry();
     await client.query('BEGIN');
 
     const { epc, rssi, count, timestamp, deviceId } = req.body;
@@ -170,7 +188,7 @@ app.post('/api/v1/uhf/tags', async (req, res) => {
       code: 201
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client) await client.query('ROLLBACK');
     console.error('UHF tag creation error:', error);
     res.status(500).json({
       success: false,
@@ -178,14 +196,15 @@ app.post('/api/v1/uhf/tags', async (req, res) => {
       code: 500
     });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
 // POST /api/v1/uhf/tags/batch - Create multiple UHF tags (matches RFID service structure)
 app.post('/api/v1/uhf/tags/batch', async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await getClientWithRetry();
     await client.query('BEGIN');
 
     const { tags, sessionId } = req.body;
@@ -263,7 +282,7 @@ app.post('/api/v1/uhf/tags/batch', async (req, res) => {
       code: 201
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client) await client.query('ROLLBACK');
     console.error('UHF tags batch creation error:', error);
     res.status(500).json({
       success: false,
@@ -271,40 +290,25 @@ app.post('/api/v1/uhf/tags/batch', async (req, res) => {
       code: 500
     });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
 // GET /api/v1/uhf/tags - Get UHF tags with pagination (matches RFID service structure)
 app.get('/api/v1/uhf/tags', async (req, res) => {
   try {
-    const { page = 1, limit = 10 } = req.query;
-    const offset = (page - 1) * limit;
-    
+    // শুধু সব রেকর্ড আনবে
     const query = `
       SELECT * FROM rfid_tags 
-      ORDER BY created_at DESC 
-      LIMIT $1 OFFSET $2;
+      ORDER BY created_at DESC;
     `;
     
-    const result = await pool.query(query, [parseInt(limit), parseInt(offset)]);
-    
-    const countQuery = `SELECT COUNT(*) FROM rfid_tags;`;
-    const countResult = await pool.query(countQuery);
-    const total = parseInt(countResult.rows[0].count, 10);
+    const result = await pool.query(query);
 
     res.status(200).json({
       success: true,
       message: `Retrieved ${result.rows.length} UHF tags`,
-      data: JSON.stringify({
-        tags: result.rows,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          totalPages: Math.ceil(total / limit)
-        }
-      }),
+      data: result.rows,
       code: 200
     });
   } catch (error) {
@@ -319,8 +323,9 @@ app.get('/api/v1/uhf/tags', async (req, res) => {
 
 // DELETE /api/v1/uhf/tags/:epc - Delete UHF tag by EPC (matches RFID service structure)
 app.delete('/api/v1/uhf/tags/:epc', async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await getClientWithRetry();
     await client.query('BEGIN');
 
     const { epc } = req.params;
@@ -349,7 +354,7 @@ app.delete('/api/v1/uhf/tags/:epc', async (req, res) => {
       code: 200
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client) await client.query('ROLLBACK');
     console.error('Error deleting UHF tag:', error);
     res.status(500).json({
       success: false,
@@ -357,7 +362,7 @@ app.delete('/api/v1/uhf/tags/:epc', async (req, res) => {
       code: 500
     });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
